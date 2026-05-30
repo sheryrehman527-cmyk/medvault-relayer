@@ -1,3 +1,13 @@
+/**
+ * MedVault anonymous-apply relayer (Arbitrum Sepolia).
+ *
+ * POST /relay/apply-stage    — stage FHE eligibility (not visible to sponsors)
+ * POST /relay/apply-finalize — only when decryptedEligible === true (100% FHE pass)
+ *
+ * Railway env:
+ *   REGISTRY_ADDRESS, SEMAPHORE_ADDRESS, RELAYER_PRIVATE_KEY, RPC_URL (or ARBITRUM_SEPOLIA_RPC_URL)
+ *   Optional: FRONTEND_URL, PORT
+ */
 const express = require("express");
 const { ethers } = require("ethers");
 const cors = require("cors");
@@ -12,17 +22,23 @@ app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   max: 5,
-  message: { error: "Too many requests, slow down" }
+  message: { error: "Too many requests, slow down" },
 });
 
-const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+if (!process.env.RELAYER_PRIVATE_KEY) {
+  throw new Error("Missing RELAYER_PRIVATE_KEY in environment");
+}
+
+const provider = new ethers.JsonRpcProvider(
+  process.env.RPC_URL || process.env.ARBITRUM_SEPOLIA_RPC_URL || "https://sepolia-rollup.arbitrum.io/rpc"
+);
 const relayerWallet = new ethers.Wallet(process.env.RELAYER_PRIVATE_KEY, provider);
 
 const REGISTRY_ADDRESS = process.env.REGISTRY_ADDRESS;
 const SEMAPHORE_ADDRESS = process.env.SEMAPHORE_ADDRESS;
 
 if (!REGISTRY_ADDRESS || !SEMAPHORE_ADDRESS) {
-  throw new Error("Missing REGISTRY_ADDRESS or SEMAPHORE_ADDRESS in .env");
+  throw new Error("Missing REGISTRY_ADDRESS or SEMAPHORE_ADDRESS in environment");
 }
 
 const REGISTRY_ABI = [
@@ -31,19 +47,17 @@ const REGISTRY_ABI = [
   "function hasAppliedToTrial(uint256 trialId, uint256 nullifierHash) external view returns (bool)",
   "function patientGroupId() external view returns (uint256)",
   "function eligibilityEngine() external view returns (address)",
-  "function semaphore() external view returns (address)"
+  "function semaphore() external view returns (address)",
 ];
 
 const SEMAPHORE_ABI = [
   "function verifyProof(uint256 groupId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof) external view returns (bool)",
-  "function getMerkleTreeRoot(uint256 groupId) external view returns (uint256)",
 ];
 
 const registry = new ethers.Contract(REGISTRY_ADDRESS, REGISTRY_ABI, relayerWallet);
-
 const semaphore = new ethers.Contract(SEMAPHORE_ADDRESS, SEMAPHORE_ABI, provider);
 
-app.get("/health", (_, res) => res.json({ status: "ok" }));
+app.get("/health", (_, res) => res.json({ status: "ok", registry: REGISTRY_ADDRESS }));
 
 function toBigInt(value, fieldName) {
   try {
@@ -63,9 +77,7 @@ function findRevertData(err, depth = 0) {
   if (typeof err.data === "string" && err.data.startsWith("0x") && err.data.length > 10) {
     return err.data;
   }
-  const fromNested =
-    findRevertData(err.error, depth + 1) ||
-    findRevertData(err.cause, depth + 1);
+  const fromNested = findRevertData(err.error, depth + 1) || findRevertData(err.cause, depth + 1);
   if (fromNested) return fromNested;
   if (typeof err.info?.error?.data === "string" && err.info.error.data.startsWith("0x")) {
     return err.info.error.data;
@@ -75,7 +87,6 @@ function findRevertData(err, depth = 0) {
 
 const ERROR_STRING_IFACE = new ethers.Interface(["error Error(string)"]);
 
-/** Attach decoded Error(string) or revert hex preview for CoFHE / custom errors. */
 function formatContractRevert(err) {
   const base = extractErrorMessage(err);
   const data = findRevertData(err);
@@ -89,7 +100,7 @@ function formatContractRevert(err) {
     /* not Error(string) */
   }
   const byteLen = Math.floor((data.length - 2) / 2);
-  return `${base} | revertData=${data.slice(0, 14)}… (${byteLen} bytes, likely CoFHE/TaskManager custom error — compare REGISTRY_ADDRESS + staged ctHash)`;
+  return `${base} | revertData=${data.slice(0, 14)}… (${byteLen} bytes)`;
 }
 
 function normalizeDecryptSig(input) {
@@ -122,7 +133,7 @@ function parseProofFromBody(rawProof) {
     nullifier: toBigInt(rawProof.nullifier, "proof.nullifier"),
     message: toBigInt(rawProof.message, "proof.message"),
     scope: toBigInt(rawProof.scope, "proof.scope"),
-    points: rawProof.points.map((p, idx) => toBigInt(p, `proof.points[${idx}]`))
+    points: rawProof.points.map((p, idx) => toBigInt(p, `proof.points[${idx}]`)),
   };
 }
 
@@ -145,6 +156,11 @@ async function runStartupChecks() {
   if (eligibilityEngine === ethers.ZeroAddress) {
     throw new Error("registry.eligibilityEngine() is zero address");
   }
+
+  console.log(`Relayer wallet: ${relayerWallet.address}`);
+  console.log(`Registry:       ${REGISTRY_ADDRESS}`);
+  console.log(`Semaphore:      ${SEMAPHORE_ADDRESS}`);
+  console.log(`Chain:          ${network.chainId}`);
 }
 
 async function validateConsentAndSemaphoreProof(reqBody, preflightLabel) {
@@ -184,8 +200,9 @@ async function validateConsentAndSemaphoreProof(reqBody, preflightLabel) {
     const isValidProof = await semaphore.verifyProof(groupId, proofForContract);
     if (!isValidProof) {
       return {
-        error: "Semaphore proof invalid (expired root, unknown root, nullifier reused, or malformed proof)",
-        status: 400
+        error:
+          "Semaphore proof invalid (expired root, unknown root, nullifier reused, or malformed proof)",
+        status: 400,
       };
     }
   } catch (proofErr) {
@@ -205,13 +222,13 @@ async function validateConsentAndSemaphoreProof(reqBody, preflightLabel) {
     trialIdBI: toBigInt(trialId, "trialId"),
     commitmentBI: toBigInt(commitment, "commitment"),
     permitRecipientAddr,
-    proofForContract
+    proofForContract,
   };
 }
 
 async function relayStage(req, res) {
   console.log("─────────────────────────────────────────");
-  console.log("STAGE RAW PROOF:", JSON.stringify(req.body.proof, null, 2));
+  console.log("STAGE trialId:", req.body?.trialId);
 
   try {
     const v = await validateConsentAndSemaphoreProof(req.body, "stage");
@@ -260,7 +277,7 @@ async function relayStage(req, res) {
 
 async function relayFinalize(req, res) {
   console.log("─────────────────────────────────────────");
-  console.log("FINALIZE RAW PROOF:", JSON.stringify(req.body.proof, null, 2));
+  console.log("FINALIZE trialId:", req.body?.trialId, "decryptedEligible:", req.body?.decryptedEligible);
 
   try {
     const { decryptedEligible, decryptSignature } = req.body;
@@ -277,9 +294,15 @@ async function relayFinalize(req, res) {
       return res.status(400).json({ error: normErr.message || String(normErr) });
     }
 
-    console.log(
-      `finalize meta: decryptedEligible=${decElig} sigBytes=${Math.floor((sigBytes.length - 2) / 2)} registry=${REGISTRY_ADDRESS}`
-    );
+    // Gate: only 100% FHE-eligible patients finalize → sponsors never see ineligible applies.
+    if (decElig !== true) {
+      console.log("⛔ Finalize rejected: patient not eligible");
+      return res.status(400).json({
+        error:
+          "Not eligible for this trial: decryptedEligible must be true. Finalize was rejected so the application is not sent to sponsors.",
+        code: "NOT_ELIGIBLE",
+      });
+    }
 
     const v = await validateConsentAndSemaphoreProof(req.body, "finalize");
     if (v.error) return res.status(v.status).json({ error: v.error });
@@ -290,7 +313,7 @@ async function relayFinalize(req, res) {
         v.proofForContract,
         v.commitmentBI,
         v.permitRecipientAddr,
-        decElig,
+        true,
         sigBytes
       );
       console.log("✅ finalize staticCall passed");
@@ -305,7 +328,7 @@ async function relayFinalize(req, res) {
       v.proofForContract,
       v.commitmentBI,
       v.permitRecipientAddr,
-      decElig,
+      true,
       sigBytes
     );
     const gasLimit = (estimatedGas * 130n) / 100n;
@@ -315,7 +338,7 @@ async function relayFinalize(req, res) {
       v.proofForContract,
       v.commitmentBI,
       v.permitRecipientAddr,
-      decElig,
+      true,
       sigBytes,
       { gasLimit }
     );
@@ -334,10 +357,10 @@ async function relayFinalize(req, res) {
 app.post("/relay/apply-stage", limiter, relayStage);
 app.post("/relay/apply-finalize", limiter, relayFinalize);
 
-/** @deprecated Use /relay/apply-stage then /relay/apply-finalize */
 app.post("/relay/apply", limiter, (_, res) => {
   res.status(410).json({
-    error: "Deprecated: use POST /relay/apply-stage then POST /relay/apply-finalize (eligible-only CoFHE finalize gate)."
+    error:
+      "Deprecated: use POST /relay/apply-stage then POST /relay/apply-finalize (eligible-only gate).",
   });
 });
 
@@ -345,7 +368,7 @@ const PORT = process.env.PORT || 3000;
 
 runStartupChecks()
   .then(() => {
-    app.listen(PORT, () => console.log(`Relayer running on port ${PORT}`));
+    app.listen(PORT, () => console.log(`MedVault relayer listening on port ${PORT}`));
   })
   .catch((err) => {
     console.error("Startup checks failed:", extractErrorMessage(err));
